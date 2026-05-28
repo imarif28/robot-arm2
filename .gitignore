@@ -1,0 +1,16 @@
+# Flutter
+arm_app/.dart_tool/
+arm_app/.flutter-plugins
+arm_app/.flutter-plugins-dependencies
+arm_app/build/
+arm_app/.packages
+arm_app/pubspec.lock
+
+# Arduino
+arm_servo/*.elf
+arm_servo/*.bin
+arm_servo/build/
+
+# General
+.DS_Store
+*.log
