@@ -21,6 +21,8 @@
 #include <PubSubClient.h>
 #include <ESP32Servo.h>
 #include <Preferences.h>
+#include "soc/soc.h"           // Brownout detector disable
+#include "soc/rtc_cntl_reg.h"  // WRITE_PERI_REG
 
 // ─── Servo Configuration ───────────────────────────────────
 struct ServoConfig {
@@ -203,11 +205,14 @@ void saveConfigCallback() {
 //  SERVO SETUP
 // ════════════════════════════════════════════════════════════
 
-/// Attach all servos to their pins and write initial positions
+/// Attach all servos to their pins and write initial positions.
+/// Uses staggered delays to reduce simultaneous current draw.
 void setupServos() {
   for (int i = 0; i < SERVO_COUNT; i++) {
     servos[i].servo.attach(servos[i].pin);
+    delay(150);  // stagger to avoid simultaneous inrush current
     servos[i].servo.write(servos[i].initialPosition);
+    delay(300);  // wait for servo to settle before attaching next one
     Serial.print("[SERVO] ");
     Serial.print(servos[i].name);
     Serial.print(" attached to pin ");
@@ -265,6 +270,9 @@ void setupWiFi() {
 //  SETUP
 // ════════════════════════════════════════════════════════════
 void setup() {
+  // Disable brownout detector — servos can cause voltage dips on startup
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(1000);
   Serial.println();
@@ -272,7 +280,7 @@ void setup() {
   Serial.println("  Robot Arm Controller — ESP32 + MQTT");
   Serial.println("========================================");
 
-  // 1. Setup servos
+  // 1. Setup servos (staggered to reduce inrush current)
   setupServos();
 
   // 2. Load saved MQTT config from NVS
