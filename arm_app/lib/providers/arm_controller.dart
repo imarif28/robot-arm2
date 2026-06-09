@@ -15,13 +15,16 @@ import '../services/mqtt_service.dart';
 class ArmController extends ChangeNotifier {
   final MqttService _mqttService = MqttService();
 
-  // ── Servo States ──────────────────────────────────────
+  // ── Servo States ──────────────────────────────────────────
   final Map<String, ServoState> servos = {
-    'base':     ServoState(name: 'base',     currentAngle: 90, maxAngle: 180),
+    'base':     ServoState(name: 'base',     currentAngle: 90, isContinuous: true),
     'shoulder': ServoState(name: 'shoulder', currentAngle: 90),
     'elbow':    ServoState(name: 'elbow',    currentAngle: 90),
     'gripper':  ServoState(name: 'gripper',  currentAngle: 90),
   };
+
+  // ── Base 360° continuous servo tracking ─────────────────
+  bool _isBaseMoving = false;
 
   // ── Connection Settings ───────────────────────────────
   String _brokerIP = '192.168.1.100';
@@ -129,7 +132,18 @@ class ArmController extends ChangeNotifier {
   /// Save settings and connect to MQTT.
   Future<bool> saveAndConnect(String ip, int port, String ssid) async {
     await saveSettings(ip, port, ssid);
-    return await connectMqtt();
+    final success = await connectMqtt();
+    if (success) {
+      _sendBaseStop();  // Safety: ensure base is stopped on connect
+    }
+    return success;
+  }
+
+  /// Send base:90 (STOP) to ensure continuous servo is not spinning.
+  void _sendBaseStop() {
+    servos['base']!.baseWriteValue = 90;
+    _mqttService.publish('base:90');
+    debugPrint('[BASE] Safety STOP sent');
   }
 
   // ════════════════════════════════════════════════════════
@@ -139,8 +153,17 @@ class ArmController extends ChangeNotifier {
   /// Update left joystick position (Base X, Shoulder Y).
   /// Starts a periodic timer to send MQTT commands every 100ms.
   void updateLeftJoystick(double x, double y) {
+    final wasBaseActive = _leftX.abs() > 0.1;
     _leftX = x;
     _leftY = y;
+
+    // If Base X axis just returned to center, send STOP immediately
+    if (wasBaseActive && _leftX.abs() <= 0.1 && _isBaseMoving) {
+      _isBaseMoving = false;
+      _sendBaseStop();
+      notifyListeners();
+    }
+
     _ensureTimerRunning();
   }
 
@@ -172,23 +195,25 @@ class ArmController extends ChangeNotifier {
 
   /// Process joystick input: calculate new angles and publish via MQTT.
   void _processJoystickInput() {
-    // Left joystick: X → Base, Y → Shoulder
+    // Left joystick: X → Base (360° continuous), Y → Shoulder (180°)
     if (_leftX.abs() > 0.1) {
-      // X axis: positive = right (increase), negative = left (decrease)
-      int step = (_leftX * _speed).round();
-      if (servos['base']!.adjustAngle(step)) {
-        _mqttService.publish(servos['base']!.toPayload());
-      }
+      // Base: 360° continuous rotation
+      // offset = speed * 5, clamped to keep value in 40–140 range
+      int offset = (_leftX * _speed * 5).round();
+      int writeValue = (90 + offset).clamp(40, 140);
+      servos['base']!.baseWriteValue = writeValue;
+      _mqttService.publish(servos['base']!.toPayload());
+      _isBaseMoving = true;
     }
     if (_leftY.abs() > 0.1) {
-      // Y axis: negative = up (increase angle), positive = down (decrease)
+      // Shoulder: 180° positional (Y axis: negative = up, positive = down)
       int step = (-_leftY * _speed).round();
       if (servos['shoulder']!.adjustAngle(step)) {
         _mqttService.publish(servos['shoulder']!.toPayload());
       }
     }
 
-    // Right joystick: Y → Elbow, X → Gripper
+    // Right joystick: Y → Elbow, X → Gripper (both 180° positional)
     if (_rightY.abs() > 0.1) {
       int step = (-_rightY * _speed).round();
       if (servos['elbow']!.adjustAngle(step)) {

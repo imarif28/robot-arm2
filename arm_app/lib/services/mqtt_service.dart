@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
@@ -47,6 +46,7 @@ class MqttService {
   Timer? _esp32TimeoutTimer;
 
   Timer? _reconnectTimer;
+  StreamSubscription? _updatesSubscription;  // Track to prevent duplicate listeners
   String? _brokerIP;
   int? _port;
   bool _intentionalDisconnect = false;
@@ -70,7 +70,7 @@ class MqttService {
       }
 
       _client = MqttServerClient.withPort(brokerIP, 'flutter_arm_${DateTime.now().millisecondsSinceEpoch}', port);
-      _client!.logging(on: true);
+      _client!.logging(on: kDebugMode);
       _client!.keepAlivePeriod = 30;
       _client!.autoReconnect = true;
       _client!.onAutoReconnect = _onAutoReconnect;
@@ -120,10 +120,15 @@ class MqttService {
   }
 
   /// Disconnect from the broker intentionally.
+  /// Sends base:90 STOP before disconnecting to prevent continuous servo runaway.
   void disconnect() {
     _intentionalDisconnect = true;
     _reconnectTimer?.cancel();
     _esp32TimeoutTimer?.cancel();
+    // Safety: stop continuous servos before disconnecting
+    if (_currentStatus == MqttConnectionStatus.connected) {
+      publish('base:90');
+    }
     _client?.disconnect();
     _updateStatus(MqttConnectionStatus.disconnected);
     _updateEsp32Status(false);
@@ -186,8 +191,11 @@ class MqttService {
     _client!.subscribe(statusTopic, MqttQos.atMostOnce);
     debugPrint('[MQTT] Subscribed to status topic: $statusTopic');
 
+    // Cancel any existing listener to prevent duplicate processing
+    _updatesSubscription?.cancel();
+
     // Listen for incoming messages on the status topic
-    _client!.updates?.listen((List<MqttReceivedMessage<MqttMessage>> messages) {
+    _updatesSubscription = _client!.updates?.listen((List<MqttReceivedMessage<MqttMessage>> messages) {
       for (final msg in messages) {
         if (msg.topic == statusTopic) {
           final payload = MqttPublishPayload.bytesToStringAsString(
@@ -217,6 +225,7 @@ class MqttService {
   void dispose() {
     _reconnectTimer?.cancel();
     _esp32TimeoutTimer?.cancel();
+    _updatesSubscription?.cancel();
     _statusController.close();
     _messageController.close();
     _esp32StatusController.close();

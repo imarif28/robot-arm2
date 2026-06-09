@@ -6,13 +6,14 @@
  *  Libraries: ESP32Servo, PubSubClient, WiFiManager, Preferences
  *
  *  Servo mapping:
- *    Index 0 → Base     → Pin 27 → 360° → initial 90
- *    Index 1 → Shoulder → Pin 26 → 180° → initial 90
- *    Index 2 → Elbow    → Pin 25 → 180° → initial 90
- *    Index 3 → Gripper  → Pin 33 → 180° → initial 90
+ *    Index 0 → Base     → Pin 27 → 360° continuous rotation
+ *              write(90)=STOP, <90=CW, >90=CCW
+ *    Index 1 → Shoulder → Pin 26 → 180° positional
+ *    Index 2 → Elbow    → Pin 25 → 180° positional
+ *    Index 3 → Gripper  → Pin 33 → 180° positional
  *
  *  MQTT topic : robot/arm/control
- *  Payload    : "nama_servo:angle"  (e.g. "base:90")
+ *  Payload    : "servo_name:value"  (e.g. "base:90", "shoulder:45")
  * ============================================
  */
 
@@ -23,6 +24,9 @@
 #include <Preferences.h>
 #include "soc/soc.h"           // Brownout detector disable
 #include "soc/rtc_cntl_reg.h"  // WRITE_PERI_REG
+#include <esp_task_wdt.h>      // Hardware Watchdog Timer
+
+#define WDT_TIMEOUT 15         // 15 seconds WDT timeout
 
 // ─── Servo Configuration ───────────────────────────────────
 struct ServoConfig {
@@ -30,14 +34,14 @@ struct ServoConfig {
   int pin;
   String name;
   int initialPosition;
-  int maxAngle;  // 360 for base, 180 for others
+  bool isContinuous;  // true = 360° continuous rotation, false = 180° positional
 };
 
 ServoConfig servos[] = {
-  { Servo(), 27, "base",     90, 360 },
-  { Servo(), 26, "shoulder", 90, 180 },
-  { Servo(), 25, "elbow",    90, 180 },
-  { Servo(), 33, "gripper",  90, 180 },
+  { Servo(), 27, "base",     90, true  },  // 360° continuous: 90=STOP, <90=CW, >90=CCW
+  { Servo(), 26, "shoulder", 90, false },  // 180° positional
+  { Servo(), 25, "elbow",    90, false },  // 180° positional
+  { Servo(), 33, "gripper",  90, false },  // 180° positional
 };
 const int SERVO_COUNT = sizeof(servos) / sizeof(servos[0]);
 
@@ -60,60 +64,83 @@ WiFiManagerParameter customMqttPort("mqtt_port", "MQTT Port", mqttPort, 6);
 unsigned long lastReconnectAttempt = 0;
 const unsigned long RECONNECT_INTERVAL = 5000;  // 5 seconds
 
+// ─── MQTT retry limit ──────────────────────────────────────
+int mqttRetryCount = 0;
+const int MAX_MQTT_RETRIES = 10;  // After 10 failed attempts (~50s), open config portal
+
 // Flag to save config when WiFiManager sets new params
 bool shouldSaveConfig = false;
 
 // ════════════════════════════════════════════════════════════
-//  MQTT CALLBACK — parse payload "servo_name:angle"
+//  MQTT CALLBACK — parse payload "servo_name:value"
 // ════════════════════════════════════════════════════════════
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Build string from payload
-  String message = "";
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
+  // Build string from payload efficiently using buffer
+  char buffer[length + 1];
+  memcpy(buffer, payload, length);
+  buffer[length] = '\0';
+  String message = String(buffer);
 
   Serial.print("[MQTT] Received on ");
   Serial.print(topic);
   Serial.print(": ");
   Serial.println(message);
 
-  // Parse "nama_servo:angle"
+  // Parse "servo_name:value"
   int separatorIndex = message.indexOf(':');
   if (separatorIndex == -1) {
-    Serial.println("[MQTT] ERROR: Invalid format. Expected 'name:angle'");
+    Serial.println("[MQTT] ERROR: Invalid format. Expected 'name:value'");
     return;
   }
 
   String servoName = message.substring(0, separatorIndex);
-  int angle = message.substring(separatorIndex + 1).toInt();
+  int value = message.substring(separatorIndex + 1).toInt();
 
   servoName.trim();
   servoName.toLowerCase();
 
-  // Find matching servo and write angle
+  // Find matching servo and write value
   bool found = false;
   for (int i = 0; i < SERVO_COUNT; i++) {
     if (servoName == servos[i].name) {
       found = true;
 
-      // Validate angle range
-      if (angle < 0 || angle > servos[i].maxAngle) {
-        Serial.print("[MQTT] ERROR: Angle ");
-        Serial.print(angle);
-        Serial.print(" out of range for ");
-        Serial.print(servos[i].name);
-        Serial.print(" (0-");
-        Serial.print(servos[i].maxAngle);
-        Serial.println(")");
-        return;
-      }
+      if (servos[i].isContinuous) {
+        // ── 360° Continuous Rotation Servo ──
+        // Value 0–180 maps directly to servo.write()
+        // 90 = STOP, <90 = CW, >90 = CCW
+        int safeValue = constrain(value, 0, 180);
+        servos[i].servo.write(safeValue);
 
-      servos[i].servo.write(angle);
-      Serial.print("[SERVO] ");
-      Serial.print(servos[i].name);
-      Serial.print(" → ");
-      Serial.println(angle);
+        // Detailed logging
+        Serial.print("[SERVO] ");
+        Serial.print(servos[i].name);
+        if (safeValue == 90) {
+          Serial.println(": STOP");
+        } else if (safeValue < 90) {
+          Serial.print(": CW speed ");
+          Serial.println(90 - safeValue);
+        } else {
+          Serial.print(": CCW speed ");
+          Serial.println(safeValue - 90);
+        }
+      } else {
+        // ── 180° Positional Servo ──
+        if (value < 0 || value > 180) {
+          Serial.print("[MQTT] ERROR: Angle ");
+          Serial.print(value);
+          Serial.print(" out of range for ");
+          Serial.print(servos[i].name);
+          Serial.println(" (0-180)");
+          return;
+        }
+        servos[i].servo.write(value);
+        Serial.print("[SERVO] ");
+        Serial.print(servos[i].name);
+        Serial.print(" → ");
+        Serial.print(value);
+        Serial.println("°");
+      }
       break;
     }
   }
@@ -143,19 +170,33 @@ bool mqttConnect() {
   // Connect with LWT: publish "offline" to status topic when disconnected unexpectedly
   if (mqttClient.connect(clientId.c_str(), MQTT_STATUS_TOPIC, 1, true, "offline")) {
     Serial.println("[MQTT] Connected!");
+    mqttRetryCount = 0;  // Reset retry counter on success
 
     // Publish "online" status (retained) so Flutter app knows ESP32 is alive
     mqttClient.publish(MQTT_STATUS_TOPIC, "online", true);
     Serial.println("[MQTT] Published 'online' to status topic");
+
+    // Safety: STOP all continuous rotation servos on connect/reconnect
+    for (int i = 0; i < SERVO_COUNT; i++) {
+      if (servos[i].isContinuous) {
+        servos[i].servo.write(90);  // 90 = STOP
+        Serial.print("[SERVO] Safety STOP: ");
+        Serial.println(servos[i].name);
+      }
+    }
 
     mqttClient.subscribe(MQTT_TOPIC);
     Serial.print("[MQTT] Subscribed to topic: ");
     Serial.println(MQTT_TOPIC);
     return true;
   } else {
+    mqttRetryCount++;
     Serial.print("[MQTT] Failed, rc=");
     Serial.print(mqttClient.state());
-    Serial.println(" — will retry in 5s");
+    Serial.print(" — attempt ");
+    Serial.print(mqttRetryCount);
+    Serial.print("/");
+    Serial.println(MAX_MQTT_RETRIES);
     return false;
   }
 }
@@ -259,10 +300,55 @@ void setupWiFi() {
   Serial.println(WiFi.localIP());
 
   // If user entered new MQTT config via the portal, save it
+  _applyPortalConfig();
+}
+
+// ════════════════════════════════════════════════════════════
+//  CONFIG PORTAL — Open AP for MQTT reconfiguration
+// ════════════════════════════════════════════════════════════
+
+/// Open WiFiManager config portal on-demand so user can change MQTT settings.
+/// Called when MQTT retries are exhausted. WiFi stays connected; only the
+/// captive portal is opened for MQTT IP/port reconfiguration.
+void openConfigPortal() {
+  Serial.println();
+  Serial.println("╔══════════════════════════════════════════════╗");
+  Serial.println("║  MQTT UNREACHABLE — Opening Config Portal    ║");
+  Serial.println("║  Connect to WiFi AP 'RobotArm-Setup'        ║");
+  Serial.println("║  to change MQTT Broker IP/Port               ║");
+  Serial.println("╚══════════════════════════════════════════════╝");
+  Serial.println();
+
+  WiFiManager wm;
+  wm.setSaveConfigCallback(saveConfigCallback);
+  wm.addParameter(&customMqttIP);
+  wm.addParameter(&customMqttPort);
+  wm.setConfigPortalTimeout(180);  // 3 minutes timeout
+
+  // startConfigPortal opens AP without disconnecting existing WiFi STA
+  wm.startConfigPortal("RobotArm-Setup");
+
+  // Apply any new config entered by user
+  _applyPortalConfig();
+
+  // Reconfigure MQTT client with new settings
+  int port = atoi(mqttPort);
+  mqttClient.setServer(mqttBrokerIP, port);
+
+  // Reset retry counter for fresh attempt
+  mqttRetryCount = 0;
+  lastReconnectAttempt = 0;
+
+  Serial.println("[PORTAL] Config portal closed. Resuming MQTT connection...");
+}
+
+/// Helper: If WiFiManager saved new config, copy it to globals and persist.
+void _applyPortalConfig() {
   if (shouldSaveConfig) {
     strncpy(mqttBrokerIP, customMqttIP.getValue(), sizeof(mqttBrokerIP) - 1);
     strncpy(mqttPort, customMqttPort.getValue(), sizeof(mqttPort) - 1);
     saveMqttConfig();
+    shouldSaveConfig = false;  // Reset flag
   }
 }
 
@@ -279,6 +365,18 @@ void setup() {
   Serial.println("========================================");
   Serial.println("  Robot Arm Controller — ESP32 + MQTT");
   Serial.println("========================================");
+
+  // Initialize Watchdog Timer for ESP32 Core 3.x (ESP-IDF v5)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,    // Bitmask of all cores
+    .trigger_panic = true
+  };
+  // Try to initialize, if already initialized (by Arduino core), reconfigure it
+  if (esp_task_wdt_init(&wdt_config) != ESP_OK) {
+    esp_task_wdt_reconfigure(&wdt_config);
+  }
+  esp_task_wdt_add(NULL);               // Add current loop task to WDT
 
   // 1. Setup servos (staggered to reduce inrush current)
   setupServos();
@@ -302,8 +400,20 @@ void setup() {
 //  LOOP — maintain MQTT connection
 // ════════════════════════════════════════════════════════════
 void loop() {
+  // Feed the watchdog timer so it doesn't trigger a reset
+  esp_task_wdt_reset();
+
   // If MQTT disconnected, try to reconnect periodically
   if (!mqttClient.connected()) {
+    // Check if we've exceeded max retries → open config portal
+    if (mqttRetryCount >= MAX_MQTT_RETRIES) {
+      Serial.print("[MQTT] ");
+      Serial.print(MAX_MQTT_RETRIES);
+      Serial.println(" attempts failed. Opening config portal...");
+      openConfigPortal();
+      return;  // After portal closes, loop will start fresh
+    }
+
     unsigned long now = millis();
     if (now - lastReconnectAttempt > RECONNECT_INTERVAL) {
       lastReconnectAttempt = now;

@@ -166,6 +166,26 @@ class _ServoAngleRow extends StatelessWidget {
   }
 
   Widget _buildServoCard(String key, dynamic servo) {
+    // For continuous rotation servo (Base), show speed/direction
+    String displayValue;
+    Color valueColor;
+    if (servo.isContinuous) {
+      final int val = servo.baseWriteValue;
+      if (val == 90) {
+        displayValue = 'STOP';
+        valueColor = const Color(0xFF94A3B8);
+      } else if (val < 90) {
+        displayValue = 'CW ${90 - val}';
+        valueColor = const Color(0xFF4ADE80);
+      } else {
+        displayValue = 'CCW ${val - 90}';
+        valueColor = const Color(0xFF818CF8);
+      }
+    } else {
+      displayValue = '${servo.currentAngle}°';
+      valueColor = const Color(0xFFF1F5F9);
+    }
+
     return Expanded(
       child: Container(
         margin: const EdgeInsets.symmetric(horizontal: 4),
@@ -178,7 +198,7 @@ class _ServoAngleRow extends StatelessWidget {
         child: Column(
           children: [
             Text(
-              _capitalize(key),
+              '${_capitalize(key)}${servo.isContinuous ? ' 360°' : ''}',
               style: const TextStyle(
                 color: Color(0xFF94A3B8),
                 fontSize: 10,
@@ -187,9 +207,9 @@ class _ServoAngleRow extends StatelessWidget {
             ),
             const SizedBox(height: 2),
             Text(
-              '${servo.currentAngle}°',
-              style: const TextStyle(
-                color: Color(0xFFF1F5F9),
+              displayValue,
+              style: TextStyle(
+                color: valueColor,
                 fontSize: 16,
                 fontWeight: FontWeight.bold,
               ),

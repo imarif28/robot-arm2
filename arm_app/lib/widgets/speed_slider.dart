@@ -52,7 +52,7 @@ class SpeedSlider extends StatelessWidget {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
-                  '$value°/tick',
+                  'Level $value',
                   style: const TextStyle(
                     color: Color(0xFF818CF8),
                     fontSize: 14,
